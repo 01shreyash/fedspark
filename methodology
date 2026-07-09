@@ -1,0 +1,400 @@
+# FedSpark — Streaming-Aware, Byzantine-Robust Federated Learning on Apache Spark for Cross-Silo Financial Fraud Detection
+
+> **Audience of this document:** an AI coding agent (opencode) that will implement the project, and the student team that will defend it. Follow the **Execution Contract** (§13) exactly. Build phases in order (§10); do not start a phase until the previous phase's acceptance criteria pass.
+
+---
+
+## 1. Project Identity
+
+| Field | Value |
+|---|---|
+| Working title | **FedSpark** (rename freely in the report) |
+| One-liner | A cross-silo federated learning system where each client is itself a distributed Apache Spark application, so banks with data too large for any single machine can jointly train a fraud-detection model — with streaming ingestion, non-IID-robust + poisoning-robust aggregation, and differential privacy. |
+| Course | Big Data Systems (4th-year CSE) |
+| Primary language | Python 3.11 (PySpark) |
+| Deployment | Docker Compose on one laptop (simulates 3–5 bank silos + coordinator); architecture scales to real clusters unchanged |
+| Team size | 1–4 (see §14 for work split) |
+
+---
+
+## 2. Problem Statement & Motivation
+
+Financial fraud detection improves dramatically when institutions pool data: fraud rings hit multiple banks, and each bank alone sees only a slice of the pattern. But banks **cannot share raw transaction data** (privacy law, competition, data-residency rules). Federated Learning (FL) solves this: each bank trains locally and shares only model updates.
+
+**The gap FedSpark fills.** Mainstream FL frameworks — Flower, TensorFlow Federated, PySyft, FedML — model a "client" as a single process holding its dataset in memory. That is a cross-*device* assumption (phones). In cross-*silo* FL, one client is an entire organization whose local data is itself a big-data problem: tens of millions of transactions that need distributed storage, distributed feature engineering, and distributed training. Additionally, real transaction data is a **stream**, fraud patterns **drift**, silos are **statistically heterogeneous (non-IID)**, and a compromised silo can **poison** the global model. Existing student-accessible frameworks address none of these together.
+
+**Why Spark specifically (course fit).** Each silo runs Spark for: SQL/window-function feature engineering, Parquet/Delta lakehouse storage, Structured Streaming ingestion from Kafka, and distributed gradient computation via `mapPartitions` + `treeAggregate`. The FL layer is built from scratch on top — no FL framework is imported.
+
+---
+
+## 3. Novelty Claims (honest framing for the report)
+
+Do **not** claim to invent FL, FedProx, trimmed mean, or DP. The defensible claims — each backed by an experiment in §11 — are:
+
+1. **Spark-native FL client (systems novelty).** Local training is a distributed Spark job (partition-local SGD with per-epoch model averaging), so a silo's dataset can exceed single-node memory. No mainstream open framework offers this out of the box at student scale. *Evidence: scalability experiment E5 — FedSpark client trains on 20M+ rows where a pandas/Flower-style single-process client OOMs or thrashes.*
+2. **Streaming-aware FL loop (architecture novelty).** Silos ingest live Kafka streams via Structured Streaming into a local lakehouse, monitor concept drift (PSI), and drift signals modulate FL round participation. FL-on-data-streams is an active research frontier; here it is engineered end-to-end. *Evidence: drift experiment E4.*
+3. **Quality-Weighted Robust Aggregation, "QWRA" (algorithmic combination novelty).** Aggregation weights combine (a) data size, (b) cosine-similarity outlier rejection against the median update direction, and (c) a quality score from a small public validation set — improving vanilla FedAvg under both non-IID skew and poisoning. This specific combination is an engineering contribution, not new theory. *Evidence: E2, E3.*
+4. **Complete verticalized system.** Kafka → Spark Streaming → Delta/Parquet lakehouse → distributed local training → semi-synchronous FL with straggler handling → DP accounting → live dashboard. Comparable systems (FATE-on-Spark) are enterprise-heavyweight; FedSpark is a from-first-principles reference implementation.
+
+**Comparison table for the report:**
+
+| Capability | Flower | TFF | FATE | **FedSpark** |
+|---|---|---|---|---|
+| Client data larger than one node's RAM | ✗ | ✗ | ✓ (heavyweight) | ✓ (Spark-native) |
+| Streaming ingestion + drift-aware rounds | ✗ | ✗ | ✗ | ✓ |
+| Poisoning-robust aggregation built in | plugin | ✗ | partial | ✓ (QWRA) |
+| Differential privacy | plugin | ✓ | ✓ | ✓ (clip + Gaussian) |
+| Straggler-tolerant semi-sync rounds | partial | ✗ | ✗ | ✓ |
+| Understandable by a student team end-to-end | ✓ | ✗ | ✗ | ✓ |
+
+---
+
+## 4. System Architecture
+
+```mermaid
+flowchart LR
+    subgraph GEN[Replay Generator]
+        R[PaySim replayer<br/>+ drift injector<br/>+ poison injector]
+    end
+    subgraph KAFKA[Kafka / Redpanda]
+        T1[topic: bank-1.tx]
+        T2[topic: bank-2.tx]
+        TN[topic: bank-N.tx]
+    end
+    subgraph SILO1[Silo 1 — Bank A container]
+        S1[Structured Streaming ingest] --> L1[(Delta/Parquet lakehouse)]
+        L1 --> TR1[Spark distributed trainer]
+        D1[Drift monitor PSI]
+        S1 --> D1
+    end
+    subgraph SILON[Silo N — Bank N container]
+        SN[ingest] --> LN[(lakehouse)] --> TRN[trainer]
+    end
+    subgraph COORD[Coordinator container]
+        API[FastAPI control plane]
+        AGG[QWRA aggregator]
+        REG[(Model registry<br/>versioned .npz + JSON)]
+        VAL[(Public validation set)]
+        MET[(metrics.sqlite)]
+    end
+    DASH[Streamlit dashboard]
+
+    R --> T1 & T2 & TN
+    T1 --> S1
+    TN --> SN
+    TR1 -- "POST /update (Δw, n, loss)" --> API
+    TRN -- "POST /update" --> API
+    API -- "GET /round, GET /model" --> TR1 & TRN
+    API --> AGG --> REG
+    AGG --> VAL
+    API --> MET --> DASH
+    D1 -- "POST /drift" --> API
+```
+
+### Components (each independently testable)
+
+| Component | Responsibility | Interface | Depends on |
+|---|---|---|---|
+| `generator/` | Replay PaySim rows to Kafka with event time; inject drift & poisoning per config | Kafka topics `bank-{i}.tx` (JSON) | Kafka |
+| `silo/ingest.py` | Structured Streaming: Kafka → parse → append to local Delta/Parquet lakehouse; update drift stats via `foreachBatch` | lakehouse dir; `POST /drift` | Kafka, Spark |
+| `silo/features.py` | Spark SQL feature pipeline (batch, run at round time over lakehouse snapshot) | DataFrame in → feature DataFrame out | Spark |
+| `silo/trainer.py` | Distributed local training (Mode A/B, §6.2); produces clipped, optionally DP-noised delta | pure function: `(weights, config, df) → (delta, n, metrics)` | Spark, NumPy |
+| `silo/client.py` | Round loop: poll coordinator, train, upload | HTTP to coordinator | trainer, ingest |
+| `coordinator/api.py` | FastAPI control plane (§9) | REST | — |
+| `coordinator/aggregate.py` | QWRA + trimmed-mean fallback + staleness handling | pure function: `(deltas, meta, w, valset) → w'` | NumPy |
+| `coordinator/registry.py` | Versioned model store + metrics.sqlite writer | files | — |
+| `dashboard/app.py` | Streamlit: round progress, per-silo AUC, drift alerts, ε budget | reads metrics.sqlite | — |
+| `common/model.py` | NumPy MLP: init/forward/backward/serialize (`.npz`) | pure NumPy | — |
+| `experiments/` | Config-driven experiment runner + plot scripts | YAML in → CSV/PNG out | all |
+
+The **model** (`common/model.py`) is a plain NumPy MLP so weights move freely between Spark workers, HTTP payloads, and the aggregator — no framework serialization pain. Size: ~30 input features → dense 64 (ReLU) → dense 32 (ReLU) → 1 (sigmoid), ≈ 4.2k parameters ≈ 17 KB as float32 — trivially cheap to broadcast and POST.
+
+---
+
+## 5. Data
+
+### 5.1 Dataset
+**Primary: PaySim** (Kaggle: `ealaxi/paysim1`, CC BY-SA 4.0) — 6,362,620 synthetic mobile-money transactions. Columns: `step` (hour index), `type` (CASH_IN, CASH_OUT, DEBIT, PAYMENT, TRANSFER), `amount`, `nameOrig`, `oldbalanceOrg`, `newbalanceOrig`, `nameDest`, `oldbalanceDest`, `newbalanceDest`, `isFraud`, `isFlaggedFraud`. Fraud rate ≈ 0.13%, only in TRANSFER and CASH_OUT.
+
+**Amplifier (`generator/amplify.py`):** to justify Spark, synthesize N× copies with jittered amounts/balances (multiplicative noise ~ LogNormal(0, 0.1)), remapped account IDs, and shifted `step` offsets, preserving per-type fraud rates. Targets: dev = 200k rows, standard = 6.3M (original), scale = **25M+ rows** for experiment E5. Written directly as partitioned Parquet — never materialize in pandas.
+
+**Secondary (realism ablation, optional):** ULB Credit Card dataset (284,807 rows, PCA features V1–V28) — run the same pipeline to show generality.
+
+### 5.2 Non-IID partitioning across silos (`generator/partition.py`)
+Real banks differ in size and customer mix. Partition by:
+- **Label/type skew:** Dirichlet(α) allocation of each transaction `type` across silos; α ∈ {0.1 (severe), 0.5 (moderate), 100 (≈IID)}.
+- **Size skew:** silo shares drawn as e.g. [0.45, 0.25, 0.15, 0.10, 0.05] for 5 silos.
+- **Public validation set:** before partitioning, hold out a stratified 50k-row slice as the coordinator's public set (justification in report: synthetic/public benchmark data, no privacy issue; in production a regulator or consortium provides this).
+- **Global test set:** stratified 10% by `step` (later steps → temporal test), never seen by any silo.
+
+### 5.3 Feature engineering (Spark SQL — showcase course depth)
+Per silo, over its lakehouse snapshot:
+- `log1p(amount)`, balance-delta features (`oldbalanceOrg - newbalanceOrig - amount`, dest equivalents), zero-balance flags.
+- One-hot `type` (5).
+- **Window functions** (this is the Spark SQL depth for grading): per `nameOrig` over `step` ranges — count and sum of transactions in trailing 1/24/168 steps (velocity features); per `nameDest` — in-degree in trailing 24 steps (mule-account signal).
+- Standardize with **per-silo** statistics (note in report: this is realistic FL practice; global standardization would leak cross-silo information).
+
+Output: `features: array<float>` (~30 dims) + `label`. Persist as Parquet per round snapshot.
+
+---
+
+## 6. Algorithms
+
+### 6.1 FL round protocol (semi-synchronous, straggler-tolerant)
+```
+Coordinator state: w_v (global weights, version v), round r
+loop forever (or until R rounds):
+  publish round descriptor {r, v, deadline = now + T_round, hyperparams}
+  silos poll GET /round; each eligible silo trains and POSTs update
+  at deadline (or when all K registered silos reported):
+     if |updates| >= quorum q (default ceil(0.6*K)):
+         w_{v+1} = QWRA(w_v, updates ∪ staleness-decayed late updates from r-1)
+         evaluate w_{v+1} on public val set; log metrics; v++
+     else: extend deadline once by T_round/2, then skip round
+  late updates arriving after aggregation are buffered with staleness s=1
+  and included next round scaled by λ^s (λ = 0.5, max s = 1)
+```
+This demonstrates a real distributed-systems concern (stragglers/bounded staleness) — call it out in the report.
+
+### 6.2 Local training on Spark (the heart of the project)
+Weights broadcast to executors via `sc.broadcast`. Two modes, both implemented (compared in E1):
+
+**Mode A — synchronous distributed gradient descent (exact).** Each step: `df.rdd.mapPartitions(partition_gradient(w_bc))` emits per-partition (gradient_sum, count, loss_sum); `treeAggregate` combines; driver applies `w ← w − η·(∇L/n + μ(w − w_global))` with momentum. Deterministic and provably identical to centralized full-batch GD (unit-testable) but one Spark job per step.
+
+**Mode B — partition-local SGD with per-epoch model averaging (default, scalable).** Each epoch: every partition runs local mini-batch SGD over its own shard starting from current weights (one `mapPartitions` pass per epoch); driver averages partition models weighted by partition sizes (this is Zinkevich-style parallel SGD). E local epochs, then compute delta.
+
+Both modes apply the **FedProx proximal term** μ(w − w_global) in the gradient (μ configurable, 0 = plain FedAvg) to stabilize non-IID training.
+
+**Client-side post-processing:**
+```
+delta = w_local − w_global
+delta = delta · min(1, C / ||delta||₂)          # L2 clip, C configurable
+if dp_enabled: delta += N(0, σ²C²I)             # Gaussian mechanism
+POST {delta (npz, base64), n_samples, train_loss, mode, wall_time}
+```
+
+**Class imbalance:** weighted binary cross-entropy with positive-class weight = n_neg/n_pos (per silo), and threshold-free metrics (AUC-PR) for evaluation.
+
+### 6.3 QWRA — Quality-Weighted Robust Aggregation (`coordinator/aggregate.py`)
+```
+inputs: deltas {d_i}, sizes {n_i}, global w, public val set V
+1. Direction filter: m = coordinate-wise median of {d_i}
+   c_i = cos(d_i, m); reject i if c_i < τ (τ = 0.0) → flag silo in metrics
+2. Quality score: for each surviving i,
+   q_i = AUC_PR(w + d_i on V) − AUC_PR(w on V)      # model is 4k params: cheap
+   q_i ← max(q_i, 0) + ε_q                            # ε_q = 1e-4 floor
+3. Weights: u_i = (n_i^0.5) · q_i   (√n damps size dominance; both exponents configurable)
+4. d = Σ u_i·d_i / Σ u_i ;  w' = w + η_server · d     # η_server default 1.0
+5. Sanity fallback: also compute coordinate-wise 20%-trimmed mean d_tm;
+   if ||d − d_tm||/||d_tm|| > 5 → use d_tm and raise alert (defense in depth)
+```
+Configuration flag `aggregator: fedavg | qwra | trimmed_mean` enables ablations.
+
+### 6.4 Differential privacy accounting
+Per-round Gaussian mechanism on the clipped delta (§6.2). Report per-round (ε, δ) via the analytic Gaussian mechanism (Balle & Wang, 2018) and total budget over R rounds via basic composition (state this conservative choice explicitly in the report; mention RDP accounting as future work). Coordinator logs cumulative ε per silo; dashboard shows the budget gauge. Defaults: C = 1.0, σ = 0.8, δ = 1e-5. DP is **off** in accuracy experiments unless the scenario says otherwise (E6 measures the privacy–utility trade-off).
+
+### 6.5 Concept-drift detection (per silo, streaming)
+In `foreachBatch`: maintain rolling histograms (20 bins) of `log1p(amount)` and of model fraud-scores over the last W = 50k events; compute **PSI** against a frozen reference window captured at registration. PSI > 0.2 → `POST /drift {silo, psi}` → coordinator raises that silo's local epochs E by 1.5× and flags the drift on the dashboard. Simple, explainable, viva-friendly.
+
+### 6.6 Attack injectors (for evaluation only — clearly scoped as simulated red-team)
+- **Label flip:** generator flips `isFraud` on p% of a designated silo's stream.
+- **Model poisoning:** a compromised client multiplies its delta by −γ (γ = 5) before upload.
+Both are config switches in experiment YAMLs; they exist to *evaluate the defense* (QWRA), which is the standard methodology in robust-FL literature.
+
+---
+
+## 7. Tech Stack (pin exactly)
+
+| Layer | Choice | Version pin | Notes |
+|---|---|---|---|
+| Runtime | Python | 3.11.x | inside Linux containers (avoids Spark-on-Windows winutils pain) |
+| Compute | PySpark | 3.5.x | pin one minor (e.g. 3.5.4); Spark 4.x only if Delta pin matches |
+| Lakehouse | delta-spark | 3.2.x (Spark 3.5-compatible) | **fallback:** plain partitioned Parquet if Delta pinning fights back — acceptable, note in report |
+| Stream bus | Redpanda (Kafka-compatible) | latest stable image | single container, laptop-friendly; Kafka API identical. Bitnami Kafka (KRaft) is the alternative |
+| Control plane | FastAPI + uvicorn | current | |
+| Model math | NumPy | current | no torch/tf — deliberate (§3 claim 4) |
+| Dashboard | Streamlit + plotly | current | |
+| Metrics store | SQLite (single file, WAL mode) | stdlib | |
+| Orchestration | Docker Compose | v2 | resource caps per silo: 2 CPUs, 3 GB (compose `deploy.resources` / `mem_limit`) |
+| Tests | pytest | current | |
+| Host requirements | Docker Desktop (WSL2), ≥16 GB RAM recommended (8 GB works with 3 silos + dev dataset) | | |
+
+**Forbidden imports (design integrity):** `flwr`, `tensorflow_federated`, `syft`, `fedml`, `torch`, `tensorflow`. sklearn is allowed **only** in tests (reference implementations) and for `roc_auc_score`/`average_precision_score` in evaluation.
+
+---
+
+## 8. Repository Layout & Configuration
+
+```
+fedspark/
+├── docker-compose.yml            # redpanda, coordinator, silo-1..N, dashboard, generator
+├── Makefile                      # make dev-up / full-up / test / experiment E=<id> / plots
+├── configs/
+│   ├── base.yaml                 # model, training, protocol defaults
+│   └── experiments/E1..E6.yaml   # scenario overrides (§11)
+├── common/  (model.py, serialize.py, schemas.py, metrics.py)
+├── generator/ (amplify.py, partition.py, replay.py, inject.py)
+├── silo/    (ingest.py, features.py, trainer.py, client.py, drift.py)
+├── coordinator/ (api.py, aggregate.py, registry.py, privacy.py)
+├── dashboard/app.py
+├── experiments/ (runner.py, plots.py)
+├── tests/   (unit + integration, mirrors package layout)
+├── data/                         # gitignored; downloaded/generated artifacts
+└── docs/    (report assets, diagrams, this file)
+```
+
+`configs/base.yaml` (canonical keys — implement exactly these names):
+```yaml
+run: {seed: 42, mode: dev}            # dev | standard | scale
+data: {rows: 200000, silos: 3, dirichlet_alpha: 0.5,
+       size_shares: [0.5, 0.3, 0.2], public_val_rows: 50000}
+model: {hidden: [64, 32], features: auto}
+train: {mode: B, local_epochs: 2, batch_size: 4096, lr: 0.05,
+        momentum: 0.9, prox_mu: 0.01, pos_weight: auto}
+protocol: {rounds: 30, round_deadline_s: 120, quorum_frac: 0.6,
+           staleness_lambda: 0.5}
+aggregator: {kind: qwra, cos_tau: 0.0, size_exp: 0.5, server_lr: 1.0}
+privacy: {enabled: false, clip: 1.0, sigma: 0.8, delta: 1.0e-5}
+streaming: {enabled: false, events_per_s: 2000, drift_psi_threshold: 0.2}
+attacks: {label_flip: {silo: null, frac: 0.0},
+          model_poison: {silo: null, gamma: 0.0}}
+```
+
+---
+
+## 9. Coordinator API (control plane)
+
+All weights/deltas travel as base64-encoded `.npz` in JSON bodies (model ≈ 17 KB — fine over HTTP; no object store needed).
+
+| Method & path | Body / returns | Purpose |
+|---|---|---|
+| `POST /register` | `{silo_id, n_rows}` → `{token}` | silo enrollment |
+| `GET /round/current` | → `{round, version, deadline_utc, hyperparams}` or `{idle}` | poll for work |
+| `GET /model/{version}` | → `{version, weights_b64, arch}` | fetch global model |
+| `POST /update` | `{silo_id, round, delta_b64, n_samples, train_loss, wall_time_s}` → `{accepted, staleness}` | submit local update |
+| `POST /drift` | `{silo_id, psi, feature}` | drift signal |
+| `GET /metrics/latest` | → JSON snapshot | dashboard/debug |
+| `GET /healthz` | → 200 | compose healthcheck |
+
+Coordinator is single-process; a background thread runs the round loop (§6.1). Persist registry + metrics on a named volume so restarts resume from the latest model version.
+
+---
+
+## 10. Implementation Phases & Acceptance Criteria
+
+> Each phase = one or more git commits + green `make test`. **Do not proceed on red.** Every phase must run in `mode: dev` on a laptop in < 15 minutes.
+
+**Phase 0 — Scaffold.** Repo layout, compose file (redpanda + coordinator + 3 silos + dashboard stubs), config loader, Makefile, CI-style `make test`.
+*Accept:* `docker compose up` → all containers healthy; `GET /healthz` 200; pytest green (config round-trip test).
+
+**Phase 1 — Data pipeline.** Kaggle download instructions (manual step; script checks file hash), amplifier, non-IID partitioner, feature pipeline, Parquet lakehouse writer.
+*Accept:* partitioner unit test — silo row counts match `size_shares` ±1%, per-silo `type` distributions match Dirichlet draw (chi-square sanity); feature pipeline produces 0 nulls/NaNs; window-function features validated against a hand-computed 20-row fixture.
+
+**Phase 2 — Model + distributed trainer.** NumPy MLP with gradient check; Mode A and Mode B trainers.
+*Accept:* (a) analytic gradient matches finite differences (rel. err < 1e-5); (b) Mode A gradient over a 4-partition 10k-row DataFrame equals the single-machine full-batch gradient (atol 1e-6); (c) Mode B on 100k dev rows reaches ROC-AUC within 0.02 of sklearn `LogisticRegression` on identical features (MLP should in fact beat it).
+
+**Phase 3 — FL loop.** Coordinator API, client polling loop, FedAvg aggregation, model registry, metrics.sqlite.
+*Accept:* integration test — 3 silos, 10 rounds, IID split: global AUC-PR strictly improves over round 1 and reaches ≥ 0.90 of the centralized baseline's AUC-PR (baseline computed by a script that trains on pooled data).
+
+**Phase 4 — Heterogeneity + robustness.** FedProx term, semi-sync deadlines + staleness, attack injectors, QWRA + trimmed-mean.
+*Accept:* under `label_flip: {frac: 0.5}` on 1 of 5 silos, QWRA's final AUC-PR exceeds vanilla FedAvg's by a measurable margin (assert ≥ +0.03 in the dev-mode integration test); cosine filter flags the poisoned silo in ≥ 70% of rounds.
+
+**Phase 5 — Privacy.** Clipping + Gaussian noise, per-round analytic-Gaussian ε, composed budget, registry logging.
+*Accept:* unit test of ε computation against hand-computed reference values; end-to-end DP run completes with utility drop < 0.10 AUC-PR at σ = 0.8 on dev data.
+
+**Phase 6 — Streaming.** Replayer → Redpanda → Structured Streaming ingest → lakehouse append; PSI drift monitor; drift injector; drift-modulated rounds.
+*Accept:* replay 200k events at 2000 ev/s; lakehouse row count matches published count (exactly-once via foreachBatch idempotent writes or documented at-least-once + dedup on event id); injected drift (amount distribution ×3 after step T) raises PSI alert within 2 streaming batches.
+
+**Phase 7 — Experiment harness + evaluation.** Config-driven runner executing §11 scenarios; CSV outputs; plot scripts (AUC-PR vs rounds, robustness bars, scalability curve, drift timeline, privacy–utility frontier).
+*Accept:* `make experiment E=E1` … `E=E6` each produce their CSV + PNG artifacts; a `RESULTS.md` table is auto-generated.
+
+**Phase 8 — Dashboard + polish.** Streamlit views: round progress, per-silo contributions/flags, global metrics, drift alerts, ε gauges; README with quickstart; architecture diagram export.
+*Accept:* dashboard renders live during a 10-round dev run; README quickstart reproduced from scratch (`git clone` → `make dev-up` → results) by a team member on a clean machine.
+
+---
+
+## 11. Experimental Evaluation Plan (this is the "better than existing" proof)
+
+**Baselines:** (a) **Centralized** — pooled data, same MLP (privacy-violating upper bound); (b) **Local-only** — each silo trains alone, report mean/worst silo (lower bound); (c) **Vanilla FedAvg**; (d) **FedSpark full** (FedProx + QWRA).
+
+**Metrics:** AUC-ROC, **AUC-PR** (primary — fraud is 0.13% positive), recall @ FPR = 1%, rounds-to-target-AUC-PR, communication cost (bytes/round), round wall time, local-epoch throughput (rows/s).
+
+| ID | Question | Setup | Expected headline |
+|---|---|---|---|
+| E1 | Does FL approach centralized utility? Mode A vs B? | 5 silos, IID and α=0.5, 30 rounds | FedSpark within ~5% of centralized AUC-PR; Mode B ≈ Mode A utility at far fewer Spark jobs |
+| E2 | Non-IID robustness | α ∈ {0.1, 0.5, 100} × {FedAvg, +FedProx, +QWRA} | FedProx+QWRA degrades least at α=0.1 |
+| E3 | Poisoning robustness | 0/20/40% silos label-flipped; model-poison γ=5 | vanilla FedAvg collapses; QWRA holds within a few points of clean run |
+| E4 | Drift adaptation | streaming run, drift injected mid-way; frozen model vs continued FL | frozen model's AUC-PR decays; FedSpark recovers within a few rounds of the PSI alert |
+| E5 | **Scalability (the Spark claim)** | silo dataset 0.2M → 6.3M → 25M rows; partitions 2→8; vs single-process pandas trainer | Spark client scales near-linearly; pandas client OOMs or exceeds time budget at 25M |
+| E6 | Privacy–utility frontier | σ ∈ {0.5, 0.8, 1.2}, R=30, plot ε vs AUC-PR | readable trade-off curve; usable utility at single-digit-to-moderate ε |
+
+Every plot lands in `docs/figures/`; `RESULTS.md` is regenerated by `experiments/plots.py`. Fix seeds; run dev-mode scenarios ≥ 3 seeds and report mean ± std where wall time allows.
+
+---
+
+## 12. Big Data Systems — Syllabus Mapping (put this table in the report)
+
+| Course concept | Where it appears in FedSpark |
+|---|---|
+| Distributed storage / lakehouse | per-silo Delta/Parquet lakehouses, partitioned writes |
+| Spark Core (RDD, partitioning, shuffles) | `mapPartitions` gradient/SGD, `treeAggregate`, broadcast variables for weights |
+| Spark SQL & window functions | velocity/degree feature engineering (§5.3) |
+| Structured Streaming + Kafka | ingest pipeline, foreachBatch, exactly-once discussion |
+| Cluster resource management | per-silo executor/memory caps, straggler & staleness handling |
+| ML at scale | distributed SGD modes A/B, imbalanced-data metrics |
+| Data governance | the entire FL premise: computation moves to data, DP budgets |
+
+---
+
+## 13. Execution Contract for the AI Coding Agent (opencode)
+
+1. Build phases **strictly in order** (§10); after each phase run `make test` plus that phase's acceptance script; commit per phase with message `phase-N: <summary>`. Never proceed on red.
+2. Default to `mode: dev` (200k rows, 3 silos) for all iteration; `standard`/`scale` only in Phase 7 experiments.
+3. Deterministic seeds everywhere (`run.seed`); NumPy `default_rng`, Spark `sample(seed=)`.
+4. Respect the forbidden-imports list (§7). The FL protocol, aggregation, DP, and MLP are implemented from scratch.
+5. Keep `data/` out of git (`.gitignore`); dataset download is a documented manual step (Kaggle auth) with an integrity check.
+6. All cross-container communication via the documented API (§9) and Kafka topics — no shared-filesystem shortcuts between silos and coordinator (silos are meant to be separate organizations; a shortcut destroys the project's premise).
+7. Every module in §4's component table gets unit tests; integration tests may use `local[2]` Spark sessions and testcontainers-style compose invocations.
+8. If Delta Lake version-pinning causes friction, fall back to plain Parquet (one config switch), note it, and move on — do not burn time.
+9. Windows host: never run Spark natively on the host; everything executes inside Linux containers.
+10. If a phase's acceptance threshold is barely missed (e.g., AUC gap 0.021 vs 0.02), tune hyperparameters within `configs/base.yaml` bounds first; only then relax the threshold with an explicit note in `RESULTS.md`.
+
+---
+
+## 14. Deliverables, Timeline, Team Split
+
+**Deliverables:** repo (phases 0–8), `RESULTS.md` + figures, final report (problem → architecture → algorithms → experiments → syllabus mapping → limitations), 8–10 slide deck, 5-minute live demo script (dev-mode run + dashboard + one poisoning demo).
+
+**Timeline (10 weeks):** W1 Phase 0–1 · W2–3 Phase 2 · W4 Phase 3 · W5 Phase 4 · W6 Phase 5 · W7 Phase 6 · W8 Phase 7 · W9 Phase 8 · W10 report/demo buffer.
+
+**4-person split:** (1) data + streaming (Phases 1, 6), (2) trainer + model (Phase 2), (3) coordinator + aggregation + privacy (Phases 3–5), (4) experiments + dashboard + report (Phases 7–8). Solo: follow the phase order as-is.
+
+**Stretch goals (only if ahead of schedule):** secure aggregation via pairwise additive masking (Bonawitz-style, no dropout recovery); personalization by fine-tuning the final layer per silo (FedPer-lite); RDP-based ε accounting.
+
+---
+
+## 15. Risks & Fallbacks
+
+| Risk | Fallback |
+|---|---|
+| Laptop RAM pressure with 5 silos | 3 silos in dev/standard; 5 only for headline experiments |
+| Kafka/Redpanda flakiness on Docker Desktop | file-based Structured Streaming source (drop-in `format("json")` on a watched dir); streaming semantics preserved |
+| Delta Lake ↔ Spark version pinning pain | plain partitioned Parquet (config switch) |
+| Mode B convergence instability on severe non-IID | raise `prox_mu`, lower `lr`, more rounds; Mode A as ground-truth cross-check |
+| Kaggle download friction | mirror instructions + hash check; amplifier can also bootstrap from the ULB dataset |
+| Dev-run wall time creep | keep dev config small; cache feature Parquet between rounds (features are round-invariant in batch mode) |
+
+## 16. Key References (for the report)
+
+1. McMahan et al., *Communication-Efficient Learning of Deep Networks from Decentralized Data* (FedAvg), AISTATS 2017.
+2. Li et al., *Federated Optimization in Heterogeneous Networks* (FedProx), MLSys 2020.
+3. Kairouz et al., *Advances and Open Problems in Federated Learning*, 2021.
+4. Blanchard et al., *Machine Learning with Adversaries: Byzantine Tolerant Gradient Descent* (Krum), NeurIPS 2017.
+5. Yin et al., *Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates* (trimmed mean), ICML 2018.
+6. Abadi et al., *Deep Learning with Differential Privacy*, CCS 2016.
+7. Balle & Wang, *Improving the Gaussian Mechanism for Differential Privacy*, ICML 2018.
+8. Bonawitz et al., *Practical Secure Aggregation for Privacy-Preserving Machine Learning*, CCS 2017.
+9. Hsu et al., *Measuring the Effects of Non-Identical Data Distribution for Federated Visual Classification* (Dirichlet non-IID), 2019.
+10. Zinkevich et al., *Parallelized Stochastic Gradient Descent*, NeurIPS 2010.
+11. Zaharia et al., *Apache Spark: A Unified Engine for Big Data Processing*, CACM 2016.
+12. Lopez-Rojas et al., *PaySim: A Financial Mobile Money Simulator for Fraud Detection*, EMSS 2016.
