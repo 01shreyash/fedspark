@@ -1,0 +1,46 @@
+run:
+  seed: 42
+  mode: dev
+data:
+  rows: 200000
+  silos: 3
+  dirichlet_alpha: 0.5
+  size_shares: [0.5, 0.3, 0.2]
+  public_val_rows: 50000
+model:
+  hidden: [64, 32]
+  features: auto
+train:
+  mode: B
+  local_epochs: 2
+  batch_size: 4096
+  lr: 0.05
+  momentum: 0.9
+  prox_mu: 0.01
+  pos_weight: auto
+protocol:
+  rounds: 30
+  round_deadline_s: 120
+  quorum_frac: 0.6
+  staleness_lambda: 0.5
+aggregator:
+  kind: qwra
+  cos_tau: 0.0
+  size_exp: 0.5
+  server_lr: 1.0
+privacy:
+  enabled: false
+  clip: 1.0
+  sigma: 0.8
+  delta: 1.0e-5
+streaming:
+  enabled: false
+  events_per_s: 2000
+  drift_psi_threshold: 0.2
+attacks:
+  label_flip:
+    silo: null
+    frac: 0.0
+  model_poison:
+    silo: null
+    gamma: 0.0

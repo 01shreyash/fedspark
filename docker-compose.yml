@@ -1,0 +1,112 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --overprovisioned
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9644/v1/status/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  coordinator:
+    build: .
+    command: uvicorn coordinator.app:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - model_registry:/app/registry
+      - metrics:/app/metrics
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  silo-1:
+    build: .
+    command: python -m silo --silo-id silo-1 --coordinator http://coordinator:8000
+    mem_limit: 3g
+    cpus: "2.0"
+    volumes:
+      - .:/app
+      - lakehouse1:/app/data/lakehouse/silo-1
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      coordinator:
+        condition: service_healthy
+
+  silo-2:
+    build: .
+    command: python -m silo --silo-id silo-2 --coordinator http://coordinator:8000
+    mem_limit: 3g
+    cpus: "2.0"
+    volumes:
+      - .:/app
+      - lakehouse2:/app/data/lakehouse/silo-2
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      coordinator:
+        condition: service_healthy
+
+  silo-3:
+    build: .
+    command: python -m silo --silo-id silo-3 --coordinator http://coordinator:8000
+    mem_limit: 3g
+    cpus: "2.0"
+    volumes:
+      - .:/app
+      - lakehouse3:/app/data/lakehouse/silo-3
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      coordinator:
+        condition: service_healthy
+
+  dashboard:
+    build: .
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - metrics:/app/metrics
+    depends_on:
+      - coordinator
+
+  generator:
+    build: .
+    command: python -m generator.replay --topic bank-1.tx --events-per-s 2000
+    volumes:
+      - .:/app
+      - data_volume:/app/data
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+volumes:
+  redpanda_data:
+  model_registry:
+  metrics:
+  lakehouse1:
+  lakehouse2:
+  lakehouse3:
+  data_volume:
